@@ -1,18 +1,27 @@
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import MyCard from './components/MyCard.vue'
 
-// ---- 概念：ref 是「会盯数据变的盒子」--------------------------------
-// loading：还没拿到数据时显示占位
-// error：  请求失败时给一句人话
-// services：真实服务列表（来自 fleetkeeper /api/state）
+// ---- 数据源：Spring 云端（经 Vite 同源代理）--------------------------
+// 与 UniApp 小程序是同一张表：各端 fleetkeeper 上报，云端汇聚。
+// 字段来自 com.muguang.fleet.model.ServiceEntity。
 const loading = ref(true)
 const error = ref('')
 const services = ref([])
-const overview = ref(null)
+const token = ref('')
+const refreshing = ref(false)
 let timer = null
 
-// 把 L0-L4 翻成中文，模板里直接调用
+// 教学版固定账号；真实项目换成登录表单页，把凭据交给用户填写
+const DEMO_USER = { username: 'admin', password: 'admin123' }
+
+// 汇总：总数、健康数、上报机器列表
+const overview = computed(() => ({
+  total: services.value.length,
+  healthy: services.value.filter(s => (s.level || 0) >= 4).length,
+  reporters: [...new Set(services.value.map(s => s.note).filter(Boolean))],
+}))
+
 function levelText(l) {
   if (l >= 4) return '正常 L4'
   if (l >= 3) return '部分正常 L3'
@@ -20,63 +29,94 @@ function levelText(l) {
   return '未通过 L0'
 }
 
-// 每张卡片的颜色随等级变（动态 class，Vue 又一个核心概念）
 function tone(s) {
-  if ((s.level_number || 0) >= 4) return 'ok'
-  if ((s.level_number || 0) >= 3) return 'warn'
+  if ((s.level || 0) >= 4) return 'ok'
+  if ((s.level || 0) >= 3) return 'warn'
   return 'bad'
 }
 
-// ---- 概念：async/await 请求 ----------------------------------------
-// async 函数里可以「等待」网络返回，代码读起来像同步流程。
+// ---- JWT：登录 -> 存 token -> 每个请求带 Bearer -----------------------
+// token 只放在内存里（刷新页面重新登录），不写 localStorage：
+// 学习项目避免 XSS 直接读到长期凭据，这是最小代价的取舍。
+async function login() {
+  const r = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(DEMO_USER),
+  })
+  if (!r.ok) throw new Error('登录失败 HTTP ' + r.status)
+  const data = await r.json()
+  if (!data.token) throw new Error('登录响应缺少 token')
+  token.value = data.token
+}
+
+// 单一请求出口：统一附带 Bearer，401 时重登一次再重试
+async function api(path, retried = false) {
+  const r = await fetch(path, {
+    headers: token.value ? { Authorization: 'Bearer ' + token.value } : {},
+  })
+  if (r.status === 401 && !retried) {
+    await login()
+    return api(path, true)
+  }
+  if (!r.ok) throw new Error('HTTP ' + r.status)
+  return r.json()
+}
+
 async function load() {
   try {
-    // 走 Vite 代理：浏览器以为在请求自己网站的 /api，
-    // 实际被转发到 127.0.0.1:8799（fleetkeeper 面板）
-    const r = await fetch('/api/state')
-    if (!r.ok) throw new Error('HTTP ' + r.status)
-    const data = await r.json()
-    services.value = data.services || []
-    overview.value = data.overview || null
+    if (!token.value) await login()
+    const rows = await api('/api/services')
+    services.value = Array.isArray(rows) ? rows : []
     error.value = ''
   } catch (e) {
-    error.value = '读取失败：' + e.message + '（面板没在跑？）'
+    error.value = '读取失败：' + e.message + '（云端 8090 没在跑？）'
   } finally {
     loading.value = false
+    refreshing.value = false
   }
 }
 
-// ---- 概念：生命周期钩子 --------------------------------------------
-// onMounted = 组件出现在页面上时执行一次；这里顺便每 8 秒自动刷新
+async function reload() {
+  refreshing.value = true
+  await load()
+}
+
 onMounted(() => {
   load()
-  timer = setInterval(load, 8000)
+  timer = setInterval(load, 8000) // 8 秒轮询，与小程序下拉刷新互为对照
 })
-onUnmounted(() => clearInterval(timer)) // 组件销毁时清理，防止内存泄漏
+onUnmounted(() => clearInterval(timer))
 </script>
 
 <template>
-  <h1>Fleet 状态板（Vue 版）</h1>
+  <h1>Fleet 状态板（Vue · 云端版）</h1>
 
-  <p v-if="loading">正在读取服务…</p>
+  <p v-if="loading">正在登录并读取云端服务…</p>
 
-  <p v-else-if="error" style="color:#c0392b">{{ error }}</p>
+  <p v-else-if="error" style="color:#c0392b">
+    {{ error }}
+    <button @click="reload">重试</button>
+  </p>
 
   <template v-else>
-    <!-- 概念：插值 {{ }} 里也能写表达式 -->
     <p>
-      共 {{ overview?.total ?? services.length }} 个服务 ·
-      正常 {{ overview?.healthy ?? 0 }} ·
+      共 {{ overview.total }} 个服务 ·
+      正常 {{ overview.healthy }} ·
+      来自 {{ overview.reporters.join(' / ') || '暂无上报' }} ·
       每 8 秒自动刷新
+      <button :disabled="refreshing" @click="reload">{{ refreshing ? '刷新中…' : '立即刷新' }}</button>
     </p>
 
-    <!-- 概念：v-for 列表渲染 + :key -->
+    <!-- v-for 列表渲染 + :key；每张卡带来源机器，对应多机汇聚 -->
     <MyCard
       v-for="s in services"
-      :key="s.key"
+      :key="s.id"
       :title="s.name + ' :' + s.port"
-      :body="levelText(s.level_number || 0) + ' · 心跳 ' + (s.heartbeat || '-')"
+      :body="levelText(s.level || 0) + ' · 心跳 ' + (s.heartbeat || '-') + ' · 来自 ' + (s.note || '未知')"
       :tone="tone(s)"
     />
+
+    <p v-if="!services.length">云端还没有数据，先跑一台 fleetkeeper 的 -mode report。</p>
   </template>
 </template>
